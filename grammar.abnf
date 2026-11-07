@@ -1,0 +1,152 @@
+; Inia 0.2 surface grammar, RFC 5234 ABNF.
+;
+; This grammar is intentionally contextual. SPEC.md decides whether a
+; syntactically valid RHS is a scalar, column, aggregate, block body, or
+; operation, and performs quote-state scanning, balancing, and evaluation.
+
+document        = *(line LF) [line]
+line            = blank / comment-line / section-end / header / kv-line
+blank           = *WSP
+section-end     = *WSP "###" *WSP
+comment-line    = *WSP ";" *comment-char
+comment-char    = %x00-09 / %x0B-0C / %x0E-7F / uni
+
+; ----------------------------------------------------------------------
+; Characters and quoting
+
+uni             = %x80-D7FF / %xE000-10FFFF
+cchar           = %x00-08 / %x0B-0C / %x0E-1F / %x7F
+qchar           = %x00-21 / %x23-D7FF / %xE000-10FFFF
+
+; A quote opens only at the beginning of a token. Inside a qspan, two quotes
+; are one literal quote. The surrounding scanner handles token boundaries.
+qspan           = DQUOTE *(qchar / 2DQUOTE) DQUOTE
+
+; Bare names exclude whitespace at the separator and structural punctuation.
+; SPEC.md performs the stricter first-character and "::" checks.
+name            = quoted-name / bare-name
+quoted-name     = qspan
+bare-name       = name-first *(name-char / 1*WSP name-char / ":" name-char)
+name-first      = cchar / %x23-27 / %x2A-2B / %x2D-39 / %x3B
+                / %x40-5A / %x5C / %x5E-7E / uni
+name-char       = cchar / %x21 / %x23-27 / %x2A-2B / %x2D-39
+                / %x3B-3C / %x3E-5A / %x5C / %x5E-7E / uni
+
+; A scalar in a column/list context. Structural characters require quoting.
+scalar          = qspan / bare-scalar
+bare-scalar     = scalar-char *(scalar-char / WSP scalar-char)
+scalar-char     = cchar / %x21 / %x23-27 / %x2A-2B / %x2D-3C
+                / %x3E-5A / %x5C / %x5E-7E / uni
+
+; A single-value token may contain structural characters.
+single          = qspan / bare-single
+bare-single     = single-char *(single-char / WSP single-char)
+single-char     = cchar / %x21-7E / uni
+
+; ----------------------------------------------------------------------
+; Paths and selectors
+
+path            = root-hidden *("::" path-segment)
+                / segment *("::" path-segment)
+root-hidden     = "::" name
+path-segment    = segment / hidden-segment
+hidden-segment  = "::" name
+segment         = name / index / reverse-index / all / selector
+                / immediate-selector
+index           = 1*DIGIT
+reverse-index   = "~" 1*DIGIT
+all             = "()"
+
+selector        = bare-selector / condition-selector
+bare-selector   = "(" selector-path ")"
+selector-path   = name *("::" path-segment)
+condition-selector
+                = "(" *WSP [condition *(*WSP "," *WSP condition)] *WSP ")"
+condition       = ["::"] name *WSP "=" *WSP condition-value
+condition-value = ref / single
+
+; ((sel)) is the immediate form of the complete selector.
+immediate-selector
+                = "((" selector-body "))"
+selector-body   = selector-path
+                / condition *(*WSP "," *WSP condition)
+                / all
+                / selector
+
+; ----------------------------------------------------------------------
+; Keys, operations, and block controls
+
+kv-line         = *WSP key *WSP "=" *WSP rhs *WSP [line-comment] *WSP
+line-comment    = ";" *comment-char
+key             = ["?"] [operation] address
+operation       = "!" / "<" / ">"
+address         = path
+                / block-open
+                / block-close
+
+; The mapping form is used only before an object-array block opening.
+block-open      = path "::(" / path "::[" / path "::" mapping "::("
+block-close     = path "::)" / path "::]"
+
+; ----------------------------------------------------------------------
+; Headers
+
+header          = *WSP "[" *WSP header-body *WSP "]" *WSP
+header-body     = ["?"] header-path [header-suffix]
+header-path     = path
+header-suffix   = "()" / "[]" / mapping
+
+; A selector path has no suffix. A suffix is the section's aggregate type.
+; The parser rejects the selector/all-element forms that are used as an
+; invalid type suffix by the contextual rules in SPEC.md.
+
+; ----------------------------------------------------------------------
+; References
+
+ref             = "@" path / file-reference
+file-reference  = "@[" file-token "]" [path-tail]
+path-tail       = "::" path-segment *("::" path-segment)
+file-token      = name / qspan
+
+; ----------------------------------------------------------------------
+; Prefixes and aggregate values
+
+mapping         = "(" map-left "=" map-right ")"
+map-left        = [name]
+map-right       = [name]
+
+; The four mappings are (k1=k2), (=k2), (k1=), and (=).
+default-prefix  = "|" [default-head] *("," default-pair)
+default-head    = scalar
+default-pair    = ["::"] name *WSP "=" *WSP [scalar]
+
+prefix          = [mapping] [default-prefix]
+aggregate       = prefix (array / object)
+array           = "(" column-body ")"
+object          = "[" object-body "]"
+
+; Complete aggregates are whole values. A mapping selects object-array
+; element interpretation; contextual rules reject inappropriate mappings.
+
+; ----------------------------------------------------------------------
+; Columns and items
+
+; A comma is an optional item terminator, not an ordinary separator. A
+; logical LF is also a terminator when the enclosing value is multiline.
+column          = [item] *("," [item]) [","]
+item            = ref / scalar / aggregate / pair / no-value
+no-value        = *WSP                 ; empty item or an empty RHS
+
+pair            = item-key *WSP "=" *WSP [item-value]
+item-key        = ["::"] name / index / reverse-index
+item-value      = ref / scalar / aggregate / pair / no-value
+
+column-body     = column
+object-body     = [object-item] *("," [object-item]) [","]
+object-item     = pair / ref / deletion-item
+deletion-item   = "!" path
+
+; A block body is a column whose key syntax is selected by the enclosing
+; section/block. The following rules only describe the visible forms.
+rhs             = empty-rhs / ref / single / aggregate / column
+empty-rhs       = *WSP                 ; nothing after "="
